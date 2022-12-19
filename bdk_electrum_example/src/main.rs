@@ -1,20 +1,13 @@
 mod electrum;
-
+use bdk_core::bitcoin::Network;
+use bdk_keychain::KeychainChangeSet;
+use electrum::ElectrumClient;
 use std::fmt::Debug;
 
-use bdk_core::{
-    bitcoin::{Network, Transaction},
-    sparse_chain::SparseChain,
-    BlockId, TxHeight,
-};
-use bdk_keychain::{KeychainScan, KeychainTracker};
-use electrum::ElectrumClient;
-
 use bdk_cli::{
-    anyhow::{self, Context, Result},
+    anyhow::{self, Context},
     clap::{self, Subcommand},
 };
-use log::debug;
 
 use electrum_client::ElectrumApi;
 
@@ -38,48 +31,6 @@ enum ElectrumCommands {
         #[clap(long)]
         all: bool,
     },
-}
-
-fn fetch_transactions<K: Debug + Ord + Clone>(
-    new_sparsechain: &SparseChain<TxHeight>,
-    client: &ElectrumClient,
-    tracker: &KeychainTracker<K, TxHeight>,
-) -> Result<Vec<(Transaction, Option<TxHeight>)>> {
-    // Changeset of txids, both new and old.
-    let txid_changeset = tracker.chain().determine_changeset(new_sparsechain)?.txids;
-
-    // Only filter for txids that are new to us.
-    let new_txids = txid_changeset
-        .iter()
-        .filter_map(|(txid, index)| {
-            if !tracker.graph().contains_txid(*txid) {
-                Some((txid, index))
-            } else {
-                None
-            }
-        })
-        .collect::<Vec<_>>();
-
-    // Remaining of the transactions that only changed in Index
-    let existing_txs = txid_changeset
-        .iter()
-        .filter_map(|(txid, index)| match tracker.graph().tx(*txid) {
-            Some(tx) => Some((tx.clone(), *index)),
-            // We don't keep the index for `TxNode::Partial`s
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-
-    let new_transactions = client.batch_transaction_get(new_txids.iter().map(|(txid, _)| *txid))?;
-
-    // Add all the transaction, new and existing into scan_update
-    let transaction_update = new_transactions
-        .into_iter()
-        .zip(new_txids.into_iter().map(|(_, index)| *index))
-        .chain(existing_txs)
-        .collect::<Vec<_>>();
-
-    Ok(transaction_update)
 }
 
 fn main() -> anyhow::Result<()> {
@@ -109,38 +60,21 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    match electrum_cmd {
+    let mut changeset = KeychainChangeSet::default();
+
+    let update_chain = match electrum_cmd {
         ElectrumCommands::Scan { stop_gap } => {
             let scripts = tracker.txout_index.iter_all_script_pubkeys_by_keychain();
-
-            let mut keychain_scan = KeychainScan::default();
 
             // Wallet scan returns a sparse chain that contains new All the BlockIds and Txids
             // relevant to the wallet, along with keychain index update if required.
             let (new_sparsechain, keychain_index_update) =
                 client.wallet_txid_scan(scripts, Some(stop_gap), tracker.chain().checkpoints())?;
 
-            keychain_scan.last_active_indexes = keychain_index_update;
+            tracker.txout_index.store_all_up_to(&keychain_index_update);
+            changeset.derivation_indices = tracker.txout_index.derivation_indices();
 
-            // Inserting everything from the new_sparsechain should be okay as duplicate
-            // data would be rejected at the time of update application.
-            for (height, hash) in new_sparsechain.checkpoints() {
-                let _ = keychain_scan.update.insert_checkpoint(BlockId {
-                    height: *height,
-                    hash: *hash,
-                })?;
-            }
-
-            // Fetch the new and old transactions to be added in update structure
-            for (tx, index) in fetch_transactions(&new_sparsechain, &client, &tracker)? {
-                keychain_scan.update.insert_tx(tx, index)?;
-            }
-
-            // Apply the full scan update
-            let changeset = tracker.determine_changeset(&keychain_scan)?;
-            db.append_changeset(&changeset)?;
-            tracker.apply_changeset(changeset);
-            debug!("sync completed!!")
+            new_sparsechain
         }
         ElectrumCommands::Sync {
             mut unused,
@@ -180,34 +114,36 @@ fn main() -> anyhow::Result<()> {
                 })));
             }
 
-            let mut scan_update = KeychainScan::default();
-
             // Wallet scan returns a sparse chain that contains new All the BlockIds and Txids
             // relevant to the wallet, along with keychain index update if required.
             let new_sparsechain = client
                 .spk_txid_scan(spks, tracker.chain().checkpoints())
                 .context("scanning the blockchain")?;
 
-            // Inserting everything from the new_sparsechain should be okay as duplicate
-            // data would be rejected at the time of update application.
-            for (height, hash) in new_sparsechain.checkpoints() {
-                let _ = scan_update.update.insert_checkpoint(BlockId {
-                    height: *height,
-                    hash: *hash,
-                })?;
-            }
-
-            // Fetch the new and old transactions to be added in update structure
-            for (tx, index) in fetch_transactions(&new_sparsechain, &client, &tracker)? {
-                scan_update.update.insert_tx(tx, index)?;
-            }
-
-            // Apply the full scan update
-            let changeset = tracker.determine_changeset(&scan_update)?;
-            db.append_changeset(&changeset)?;
-            tracker.apply_changeset(changeset);
-            debug!("sync completed!!")
+            new_sparsechain
         }
-    }
+    };
+
+    // Changeset of txids, both new and old.
+    let sparse_chain_changeset = tracker.chain().determine_changeset(&update_chain)?;
+
+    // Only filter for txids that are new to us.
+    let new_txids: Vec<_> = sparse_chain_changeset
+        .txids
+        .iter()
+        // filter the transactions being removed
+        .filter_map(|(txid, index)| Some((txid, (*index)?)))
+        // filter the transactions that have moved but we already have stored
+        .filter(|(txid, index)| Some(index) != tracker.chain().tx_index(**txid))
+        .collect();
+
+    let new_txs = client.batch_transaction_get(new_txids.iter().map(|(txid, _)| *txid))?;
+    changeset.chain_graph.chain = sparse_chain_changeset;
+    changeset.chain_graph.graph.tx.extend(new_txs);
+
+    // Apply the full scan update
+    db.append_changeset(&changeset)?;
+    tracker.apply_changeset(changeset);
+
     Ok(())
 }
